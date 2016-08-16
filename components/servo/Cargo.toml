@@ -94,3 +94,6 @@ android_glue = "0.2"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 gaol = {git = "https://github.com/servo/gaol"}
+
+[target.x86_64-unknown-linux-gnu.dependencies]
+osmesa-src = {git = "https://github.com/glennw/osmesa-src"}

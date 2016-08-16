@@ -25,7 +25,7 @@ from mach.decorators import (
     Command,
 )
 
-from servo.command_base import CommandBase, call, check_call, host_triple
+from servo.command_base import CommandBase, call, check_call, find_dep_path_newest, host_triple
 from wptrunner import wptcommandline
 from update import updatecommandline
 from servo_tidy import tidy
@@ -384,6 +384,13 @@ class MachCommands(CommandBase):
 
     # Helper for test_css and test_wpt:
     def wptrunner(self, run_file, **kwargs):
+        # On Linux, find the OSMesa software rendering library and
+        # add it to the dynamic linker search path.
+        if sys.platform.startswith('linux'):
+            args = [self.get_binary_path(True, False)]
+            osmesa_path = path.join(find_dep_path_newest('osmesa-src', args[0]), "out", "lib", "gallium")
+            os.environ["LD_LIBRARY_PATH"] = osmesa_path
+
         os.environ["RUST_BACKTRACE"] = "1"
         kwargs["debug"] = not kwargs["release"]
         if kwargs.pop("chaos"):
