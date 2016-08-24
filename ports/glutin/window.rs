@@ -16,7 +16,7 @@ use gleam::gl;
 use glutin;
 #[cfg(target_os = "macos")]
 use glutin::os::macos::{ActivationPolicy, WindowBuilderExt};
-use glutin::{Api, ElementState, Event, GlRequest, MouseButton, VirtualKeyCode, MouseScrollDelta};
+use glutin::{Api, ElementState, Event, GlRequest, GlProfile, MouseButton, VirtualKeyCode, MouseScrollDelta};
 use glutin::{ScanCode, TouchPhase};
 use layers::geometry::DevicePixel;
 use layers::platform::surface::NativeDisplay;
@@ -88,9 +88,20 @@ fn builder_with_platform_options(builder: glutin::WindowBuilder) -> glutin::Wind
     builder
 }
 
+struct HeadlessContext {
+    width: u32,
+    height: u32,
+    glutin: glutin::HeadlessContext,
+}
+
+enum WindowKind {
+    Window(glutin::Window),
+    Headless(HeadlessContext),
+}
+
 /// The type of a window.
 pub struct Window {
-    window: glutin::Window,
+    kind: WindowKind,
 
     mouse_down_button: Cell<Option<glutin::MouseButton>>,
     mouse_down_point: Cell<Point2D<i32>>,
@@ -136,43 +147,69 @@ impl Window {
         // #9996.
         let visible = is_foreground && !opts::get().no_native_titlebar;
 
+        let window_kind = if opts::get().headless {
+            let builder =
+                glutin::HeadlessRendererBuilder::new(width, height).with_gl(Window::gl_version())
+                                                                   .with_gl_profile(GlProfile::Core);
 
-        let mut builder =
-            glutin::WindowBuilder::new().with_title("Servo".to_string())
-                                        .with_decorations(!opts::get().no_native_titlebar)
-                                        .with_transparency(opts::get().no_native_titlebar)
-                                        .with_dimensions(width, height)
-                                        .with_gl(Window::gl_version())
-                                        .with_visibility(visible)
-                                        .with_parent(parent)
-                                        .with_multitouch();
+            let headless_context = builder.build()
+                                          .expect("Failed to create headless context.");
 
+            unsafe { headless_context.make_current()
+                                     .expect("Failed to make context current!") }
 
-        if let Ok(mut icon_path) = resource_files::resources_dir_path() {
-            icon_path.push("servo.png");
-            builder = builder.with_icon(icon_path);
+            WindowKind::Headless(HeadlessContext {
+                width: width,
+                height: height,
+                glutin: headless_context
+            })
+        } else {
+            let mut builder =
+                glutin::WindowBuilder::new().with_title("Servo".to_string())
+                                            .with_decorations(!opts::get().no_native_titlebar)
+                                            .with_transparency(opts::get().no_native_titlebar)
+                                            .with_dimensions(width, height)
+                                            .with_gl(Window::gl_version())
+                                            .with_visibility(visible)
+                                            .with_parent(parent)
+                                            .with_multitouch();
+
+            if let Ok(mut icon_path) = resource_files::resources_dir_path() {
+                icon_path.push("servo.png");
+                builder = builder.with_icon(icon_path);
+            }
+
+            if opts::get().enable_vsync {
+                builder = builder.with_vsync();
+            }
+
+            if opts::get().use_msaa {
+                builder = builder.with_multisampling(MULTISAMPLES)
+            }
+
+            builder = builder_with_platform_options(builder);
+
+            let mut glutin_window = builder.build().expect("Failed to create window.");
+
+            unsafe { glutin_window.make_current().expect("Failed to make context current!") }
+
+            glutin_window.set_window_resize_callback(Some(Window::nested_window_resize as fn(u32, u32)));
+
+            WindowKind::Window(glutin_window)
+        };
+
+        Window::load_gl_functions(&window_kind);
+
+        if opts::get().headless {
+            // Print some information about the headless renderer that
+            // can be useful in diagnosing CI failures on build machines.
+            println!("{}", gl::get_string(gl::VENDOR));
+            println!("{}", gl::get_string(gl::RENDERER));
+            println!("{}", gl::get_string(gl::VERSION));
         }
-
-        if opts::get().enable_vsync {
-            builder = builder.with_vsync();
-        }
-
-        if opts::get().use_msaa {
-            builder = builder.with_multisampling(MULTISAMPLES)
-        }
-
-        builder = builder_with_platform_options(builder);
-
-        let mut glutin_window = builder.build().expect("Failed to create window.");
-
-        unsafe { glutin_window.make_current().expect("Failed to make context current!") }
-
-        glutin_window.set_window_resize_callback(Some(Window::nested_window_resize as fn(u32, u32)));
-
-        Window::load_gl_functions(&glutin_window);
 
         let window = Window {
-            window: glutin_window,
+            kind: window_kind,
             event_queue: RefCell::new(vec!()),
             mouse_down_button: Cell::new(None),
             mouse_down_point: Cell::new(Point2D::new(0, 0)),
@@ -194,7 +231,14 @@ impl Window {
     }
 
     pub fn platform_window(&self) -> glutin::WindowID {
-        unsafe { glutin::WindowID::new(self.window.platform_window()) }
+        match self.kind {
+            WindowKind::Window(ref window) => {
+                unsafe { glutin::WindowID::new(window.platform_window()) }
+            }
+            WindowKind::Headless(..) => {
+                unreachable!();
+            }
+        }
     }
 
     fn nested_window_resize(width: u32, height: u32) {
@@ -212,7 +256,7 @@ impl Window {
     #[cfg(not(target_os = "android"))]
     fn gl_version() -> GlRequest {
         if opts::get().use_webrender {
-            return GlRequest::Specific(Api::OpenGl, (3, 2));
+            return GlRequest::Specific(Api::OpenGl, (3, 3));
         }
         match opts::get().render_api {
             RenderApi::GL => {
@@ -230,12 +274,19 @@ impl Window {
     }
 
     #[cfg(not(target_os = "android"))]
-    fn load_gl_functions(window: &glutin::Window) {
-        gl::load_with(|s| window.get_proc_address(s) as *const c_void);
+    fn load_gl_functions(window_kind: &WindowKind) {
+        match window_kind {
+            &WindowKind::Window(ref window) => {
+                gl::load_with(|s| window.get_proc_address(s) as *const c_void);
+            }
+            &WindowKind::Headless(ref context) => {
+                gl::load_with(|s| context.glutin.get_proc_address(s) as *const c_void);
+            }
+        }
     }
 
     #[cfg(target_os = "android")]
-    fn load_gl_functions(_: &glutin::Window) {
+    fn load_gl_functions(_: &WindowKind) {
     }
 
     fn handle_window_event(&self, event: glutin::Event) -> bool {
@@ -442,23 +493,30 @@ impl Window {
         // because it doesn't call X11 functions from another thread, so doesn't
         // hit the same issues explained below.
         if opts::get().use_webrender {
-            let event = match self.window.wait_events().next() {
-                None => {
-                    warn!("Window event stream closed.");
-                    return false;
-                },
-                Some(event) => event,
-            };
-            let mut close = self.handle_window_event(event);
-            if !close {
-                while let Some(event) = self.window.poll_events().next() {
-                    if self.handle_window_event(event) {
-                        close = true;
-                        break
+            match self.kind {
+                WindowKind::Window(ref window) => {
+                    let event = match window.wait_events().next() {
+                        None => {
+                            warn!("Window event stream closed.");
+                            return false;
+                        },
+                        Some(event) => event,
+                    };
+                    let mut close = self.handle_window_event(event);
+                    if !close {
+                        while let Some(event) = window.poll_events().next() {
+                            if self.handle_window_event(event) {
+                                close = true;
+                                break
+                            }
+                        }
                     }
+                    close
+                }
+                WindowKind::Headless(..) => {
+                    false
                 }
             }
-            close
         } else {
             // TODO(gw): This is an awful hack to work around the
             // broken way we currently call X11 from multiple threads.
@@ -477,14 +535,21 @@ impl Window {
             //
             // See https://github.com/servo/servo/issues/5780
             //
-            let first_event = self.window.poll_events().next();
+            match self.kind {
+                WindowKind::Window(ref window) => {
+                    let first_event = window.poll_events().next();
 
-            match first_event {
-                Some(event) => {
-                    self.handle_window_event(event)
+                    match first_event {
+                        Some(event) => {
+                            self.handle_window_event(event)
+                        }
+                        None => {
+                            thread::sleep(Duration::from_millis(16));
+                            false
+                        }
+                    }
                 }
-                None => {
-                    thread::sleep(Duration::from_millis(16));
+                WindowKind::Headless(..) => {
                     false
                 }
             }
@@ -501,8 +566,13 @@ impl Window {
         // polling so that we don't block on a GUI event
         // such as mouse click.
         if opts::get().output_file.is_some() || opts::get().exit_after_load || opts::get().headless {
-            while let Some(event) = self.window.poll_events().next() {
-                close_event = self.handle_window_event(event) || close_event;
+            match self.kind {
+                WindowKind::Window(ref window) => {
+                    while let Some(event) = window.poll_events().next() {
+                        close_event = self.handle_window_event(event) || close_event;
+                    }
+                }
+                WindowKind::Headless(..) => {}
             }
         } else {
             close_event = self.handle_next_event();
@@ -668,44 +738,89 @@ fn create_window_proxy(_: &Window) -> Option<glutin::WindowProxy> {
 
 #[cfg(not(target_os = "android"))]
 fn create_window_proxy(window: &Window) -> Option<glutin::WindowProxy> {
-    Some(window.window.create_window_proxy())
+    match window.kind {
+        WindowKind::Window(ref window) => {
+            Some(window.create_window_proxy())
+        }
+        WindowKind::Headless(..) => {
+            None
+        }
+    }
 }
 
 impl WindowMethods for Window {
     fn framebuffer_size(&self) -> TypedSize2D<u32, DevicePixel> {
-        let scale_factor = self.window.hidpi_factor() as u32;
-        // TODO(ajeffrey): can this fail?
-        let (width, height) = self.window.get_inner_size().expect("Failed to get window inner size.");
-        TypedSize2D::new(width * scale_factor, height * scale_factor)
+        match self.kind {
+            WindowKind::Window(ref window) => {
+                let scale_factor = window.hidpi_factor() as u32;
+                // TODO(ajeffrey): can this fail?
+                let (width, height) = window.get_inner_size().expect("Failed to get window inner size.");
+                TypedSize2D::new(width * scale_factor, height * scale_factor)
+            }
+            WindowKind::Headless(ref context) => {
+                TypedSize2D::new(context.width, context.height)
+            }
+        }
     }
 
     fn size(&self) -> TypedSize2D<f32, ScreenPx> {
-        // TODO(ajeffrey): can this fail?
-        let (width, height) = self.window.get_inner_size().expect("Failed to get window inner size.");
-        TypedSize2D::new(width as f32, height as f32)
+        match self.kind {
+            WindowKind::Window(ref window) => {
+                // TODO(ajeffrey): can this fail?
+                let (width, height) = window.get_inner_size().expect("Failed to get window inner size.");
+                TypedSize2D::new(width as f32, height as f32)
+            }
+            WindowKind::Headless(ref context) => {
+                TypedSize2D::new(context.width as f32, context.height as f32)
+            }
+        }
     }
 
     fn client_window(&self) -> (Size2D<u32>, Point2D<i32>) {
-        // TODO(ajeffrey): can this fail?
-        let (width, height) = self.window.get_outer_size().expect("Failed to get window outer size.");
-        let size = Size2D::new(width, height);
-        // TODO(ajeffrey): can this fail?
-        let (x, y) = self.window.get_position().expect("Failed to get window position.");
-        let origin = Point2D::new(x as i32, y as i32);
-        (size, origin)
+        match self.kind {
+            WindowKind::Window(ref window) => {
+                // TODO(ajeffrey): can this fail?
+                let (width, height) = window.get_outer_size().expect("Failed to get window outer size.");
+                let size = Size2D::new(width, height);
+                // TODO(ajeffrey): can this fail?
+                let (x, y) = window.get_position().expect("Failed to get window position.");
+                let origin = Point2D::new(x as i32, y as i32);
+                (size, origin)
+            }
+            WindowKind::Headless(ref context) => {
+                let size = TypedSize2D::new(context.width, context.height);
+                (size, Point2D::zero())
+            }
+        }
+
     }
 
     fn set_inner_size(&self, size: Size2D<u32>) {
-        self.window.set_inner_size(size.width as u32, size.height as u32)
+        match self.kind {
+            WindowKind::Window(ref window) => {
+                window.set_inner_size(size.width as u32, size.height as u32)
+            }
+            WindowKind::Headless(..) => {}
+        }
     }
 
     fn set_position(&self, point: Point2D<i32>) {
-        self.window.set_position(point.x, point.y)
+        match self.kind {
+            WindowKind::Window(ref window) => {
+                window.set_position(point.x, point.y)
+            }
+            WindowKind::Headless(..) => {}
+        }
     }
 
     fn present(&self) {
-        if let Err(err) = self.window.swap_buffers() {
-            warn!("Failed to swap window buffers ({}).", err);
+        match self.kind {
+            WindowKind::Window(ref window) => {
+                if let Err(err) = window.swap_buffers() {
+                    warn!("Failed to swap window buffers ({}).", err);
+                }
+            }
+            WindowKind::Headless(..) => {}
         }
     }
 
@@ -724,7 +839,14 @@ impl WindowMethods for Window {
 
     #[cfg(not(target_os = "windows"))]
     fn scale_factor(&self) -> ScaleFactor<f32, ScreenPx, DevicePixel> {
-        ScaleFactor::new(self.window.hidpi_factor())
+        match self.kind {
+            WindowKind::Window(ref window) => {
+                ScaleFactor::new(window.hidpi_factor())
+            }
+            WindowKind::Headless(..) => {
+                ScaleFactor::new(1.0)
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -735,18 +857,23 @@ impl WindowMethods for Window {
     }
 
     fn set_page_title(&self, title: Option<String>) {
-        let fallback_title: String = if let Some(ref current_url) = *self.current_url.borrow() {
-            current_url.to_string()
-        } else {
-            String::from("Untitled")
-        };
+        match self.kind {
+            WindowKind::Window(ref window) => {
+                let fallback_title: String = if let Some(ref current_url) = *self.current_url.borrow() {
+                    current_url.to_string()
+                } else {
+                    String::from("Untitled")
+                };
 
-        let title = match title {
-            Some(ref title) if title.len() > 0 => &**title,
-            _ => &fallback_title,
-        };
-        let title = format!("{} - Servo", title);
-        self.window.set_title(&title);
+                let title = match title {
+                    Some(ref title) if title.len() > 0 => &**title,
+                    _ => &fallback_title,
+                };
+                let title = format!("{} - Servo", title);
+                window.set_title(&title);
+            }
+            WindowKind::Headless(..) => {}
+        }
     }
 
     fn set_page_url(&self, url: Url) {
@@ -761,7 +888,12 @@ impl WindowMethods for Window {
 
     fn load_end(&self, _: bool, _: bool, root: bool) {
         if root && opts::get().no_native_titlebar {
-            self.window.show()
+            match self.kind {
+                WindowKind::Window(ref window) => {
+                    window.show();
+                }
+                WindowKind::Headless(..) => {}
+            }
         }
     }
 
@@ -773,46 +905,51 @@ impl WindowMethods for Window {
 
     /// Has no effect on Android.
     fn set_cursor(&self, c: Cursor) {
-        use glutin::MouseCursor;
+        match self.kind {
+            WindowKind::Window(ref window) => {
+                use glutin::MouseCursor;
 
-        let glutin_cursor = match c {
-            Cursor::None => MouseCursor::NoneCursor,
-            Cursor::Default => MouseCursor::Default,
-            Cursor::Pointer => MouseCursor::Hand,
-            Cursor::ContextMenu => MouseCursor::ContextMenu,
-            Cursor::Help => MouseCursor::Help,
-            Cursor::Progress => MouseCursor::Progress,
-            Cursor::Wait => MouseCursor::Wait,
-            Cursor::Cell => MouseCursor::Cell,
-            Cursor::Crosshair => MouseCursor::Crosshair,
-            Cursor::Text => MouseCursor::Text,
-            Cursor::VerticalText => MouseCursor::VerticalText,
-            Cursor::Alias => MouseCursor::Alias,
-            Cursor::Copy => MouseCursor::Copy,
-            Cursor::Move => MouseCursor::Move,
-            Cursor::NoDrop => MouseCursor::NoDrop,
-            Cursor::NotAllowed => MouseCursor::NotAllowed,
-            Cursor::Grab => MouseCursor::Grab,
-            Cursor::Grabbing => MouseCursor::Grabbing,
-            Cursor::EResize => MouseCursor::EResize,
-            Cursor::NResize => MouseCursor::NResize,
-            Cursor::NeResize => MouseCursor::NeResize,
-            Cursor::NwResize => MouseCursor::NwResize,
-            Cursor::SResize => MouseCursor::SResize,
-            Cursor::SeResize => MouseCursor::SeResize,
-            Cursor::SwResize => MouseCursor::SwResize,
-            Cursor::WResize => MouseCursor::WResize,
-            Cursor::EwResize => MouseCursor::EwResize,
-            Cursor::NsResize => MouseCursor::NsResize,
-            Cursor::NeswResize => MouseCursor::NeswResize,
-            Cursor::NwseResize => MouseCursor::NwseResize,
-            Cursor::ColResize => MouseCursor::ColResize,
-            Cursor::RowResize => MouseCursor::RowResize,
-            Cursor::AllScroll => MouseCursor::AllScroll,
-            Cursor::ZoomIn => MouseCursor::ZoomIn,
-            Cursor::ZoomOut => MouseCursor::ZoomOut,
-        };
-        self.window.set_cursor(glutin_cursor);
+                let glutin_cursor = match c {
+                    Cursor::None => MouseCursor::NoneCursor,
+                    Cursor::Default => MouseCursor::Default,
+                    Cursor::Pointer => MouseCursor::Hand,
+                    Cursor::ContextMenu => MouseCursor::ContextMenu,
+                    Cursor::Help => MouseCursor::Help,
+                    Cursor::Progress => MouseCursor::Progress,
+                    Cursor::Wait => MouseCursor::Wait,
+                    Cursor::Cell => MouseCursor::Cell,
+                    Cursor::Crosshair => MouseCursor::Crosshair,
+                    Cursor::Text => MouseCursor::Text,
+                    Cursor::VerticalText => MouseCursor::VerticalText,
+                    Cursor::Alias => MouseCursor::Alias,
+                    Cursor::Copy => MouseCursor::Copy,
+                    Cursor::Move => MouseCursor::Move,
+                    Cursor::NoDrop => MouseCursor::NoDrop,
+                    Cursor::NotAllowed => MouseCursor::NotAllowed,
+                    Cursor::Grab => MouseCursor::Grab,
+                    Cursor::Grabbing => MouseCursor::Grabbing,
+                    Cursor::EResize => MouseCursor::EResize,
+                    Cursor::NResize => MouseCursor::NResize,
+                    Cursor::NeResize => MouseCursor::NeResize,
+                    Cursor::NwResize => MouseCursor::NwResize,
+                    Cursor::SResize => MouseCursor::SResize,
+                    Cursor::SeResize => MouseCursor::SeResize,
+                    Cursor::SwResize => MouseCursor::SwResize,
+                    Cursor::WResize => MouseCursor::WResize,
+                    Cursor::EwResize => MouseCursor::EwResize,
+                    Cursor::NsResize => MouseCursor::NsResize,
+                    Cursor::NeswResize => MouseCursor::NeswResize,
+                    Cursor::NwseResize => MouseCursor::NwseResize,
+                    Cursor::ColResize => MouseCursor::ColResize,
+                    Cursor::RowResize => MouseCursor::RowResize,
+                    Cursor::AllScroll => MouseCursor::AllScroll,
+                    Cursor::ZoomIn => MouseCursor::ZoomIn,
+                    Cursor::ZoomOut => MouseCursor::ZoomOut,
+                };
+                window.set_cursor(glutin_cursor);
+            }
+            WindowKind::Headless(..) => {}
+        }
     }
 
     fn set_favicon(&self, _: Url) {
@@ -828,7 +965,14 @@ impl WindowMethods for Window {
         unsafe {
             match opts::get().render_api {
                 RenderApi::GL => {
-                    NativeDisplay::new(self.window.platform_display() as *mut xlib::Display)
+                    match self.kind {
+                        WindowKind::Window(ref window) => {
+                            NativeDisplay::new(window.platform_display() as *mut xlib::Display)
+                        }
+                        WindowKind::Headless(..) => {
+                            unreachable!()
+                        }
+                    }
                 },
                 RenderApi::ES2 => {
                     NativeDisplay::new_egl_display()
